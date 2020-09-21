@@ -36,7 +36,7 @@
 *
 *
 * Denny
-* 16 Sep 2019  *
+* 21 Sep 2020  *
 *
 *
 */
@@ -45,10 +45,23 @@
 #include "SpinGenApi/SpinnakerGenApi.h"
 #include <opencv2/opencv.hpp>
 
+#include <unistd.h> // write(), read(), close()
+#include <termios.h> // Contains POSIX terminal control definitions
+#include <fcntl.h> // Contains file controls like O_RDWR
+#include <strings.h>
+#include <sys/time.h>
+
 using namespace std;
 using namespace Spinnaker;
 using namespace Spinnaker::GenApi;
 using namespace cv;
+
+#define BAUDRATE B115200
+#define ARDUINO "/dev/ttyACM0"
+#define FALSE 0
+#define TRUE 1
+
+volatile int STOP=FALSE; 
 
 void setCamera(CameraPtr pCam)
 {
@@ -198,13 +211,15 @@ int main()
 	int result = 0, ret;	
 	unsigned int w, h;
 	int camtime;
+	
 	bool expchanged = false, accummode = false, refreshkeypressed = false;
-	bool J0Null = true;
+	int n;
+	
 	unsigned int numdisplaypoints = 512;
-	int key, fps;
-	int t_start, t_end;
+	int key, nframes;
+	int dt;
+	struct timeval tv;
 	bool doneflag = false;	
-	int num = 0;
 	char lambdamaxstr[40];
 	char lambdaminstr[40];
 	double lambdamin, lambdamax;
@@ -270,6 +285,36 @@ int main()
 	sprintf(dirdescr, "_");
 	char dirname[80];
 	
+
+	int fd, res;	
+	struct termios oldtio, newtio;
+    char buf[255];
+
+	fd = open(ARDUINO, O_RDWR | O_NOCTTY ); 
+    if (fd < 0) 
+	{	
+		perror(ARDUINO); 
+		exit(-1); 
+	}
+	
+	tcgetattr(fd,&oldtio); /* save current port settings */
+	
+	bzero(&newtio, sizeof(newtio));
+
+	newtio.c_cflag = BAUDRATE | CRTSCTS | CS8 | CLOCAL | CREAD;
+	newtio.c_iflag = IGNPAR;
+    newtio.c_oflag = 0;
+
+    /* set input mode (non-canonical, no echo,...) */
+    newtio.c_lflag = 0;
+
+	newtio.c_cc[VTIME]    = 0;   /* inter-character timer unused */
+    newtio.c_cc[VMIN]     = 1;   /* blocking read until 1 char is received */
+	
+	tcflush(fd, TCIFLUSH);
+    tcsetattr(fd,TCSANOW,&newtio);
+	
+
 	// inputs from ini file
 	if (infile.is_open())
 	{
@@ -309,10 +354,6 @@ int main()
 
 		Mat J, S;
 		
-		indextempJ = 0;
-		indextempS = 0;
-		t_start = time(NULL);
-		fps = 0;
 		J = Mat::zeros(Size(numdisplaypoints, h), CV_64F);
 		S = Mat::zeros(Size(numdisplaypoints, h), CV_64F);
 	
@@ -341,7 +382,6 @@ int main()
 		lambdas = Mat::zeros(cv::Size(1, data_y.cols), CV_64F);		//Size(cols,rows)
 		diffk = Mat::zeros(cv::Size(1, data_y.cols), CV_64F);
 		slopes = Mat::zeros(cv::Size(data_y.rows, data_y.cols), CV_64F);
-	
 		
 		// compute lambdas
 		for (indextemp = 0; indextemp< (data_y.cols); indextemp++)
@@ -393,295 +433,413 @@ int main()
 		strcat(dirname, dirdescr);
 		// cout << "dir name:" << dirname << endl;
 		
-		
 		cout << "Acquiring images " << endl;
 		pCam->BeginAcquisition();
 		ImagePtr pResultImage;
 		ImagePtr convertedImage;
+		unsigned long time_start, time_end;	
 		while (1)	//camera frames acquisition loop, which is inside the try
 		{
-			ret = 0;
-			while(ret == 0)
+			nframes = 0;
+			
+			res = 0;
+			STOP = FALSE;	
+			
+			// write J to Arduino
+			write(fd, "J", sizeof("J"));
+			// cout << "\n Sent character \'J\' to the port ..." << endl;
+			
+			// poll to read a character back from Arduino 
+			while (STOP==FALSE) 
 			{
-				pResultImage = pCam->GetNextImage();
-				if (pResultImage->IsIncomplete())
+			  /* loop for input */
+			  res = read(fd,buf,255);   /* returns after 1 char has been input */
+			  buf[res]=0;               /* so we can printf... */
+			  // cout << endl << "Received from Arduino: " << buf <<" : " << res << " byte" << endl;
+			  if (res > 0) STOP=TRUE;
+			}
+			
+			gettimeofday(&tv,NULL);	
+			time_start = 1000000 * tv.tv_sec + tv.tv_usec;	
+			
+			// cout << "Sent HIGH to line0 of camera ...";
+			// now read a batch of J0Null background images from the camera
+			indextempJ = 0;
+			while(indextempJ < averagescount)
+			{
+				ret = 0;
+				// save one image to Mat m
+				while(ret == 0)
 				{
-					ret = 0;
+					pResultImage = pCam->GetNextImage();
+					if (pResultImage->IsIncomplete())
+					{
+						ret = 0;
+					}
+					else
+					{
+						ret = 1;
+						convertedImage = pResultImage;
+						//Mono16 w x h
+						m = cv::Mat(h, w, CV_16UC1, convertedImage->GetData(), convertedImage->GetStride());
+						nframes++;
+					}
+				}
+
+				// pResultImage has to be released to avoid buffer filling up
+				pResultImage->Release();
+
+				// convert m to data_y and process
+				if(ret == 1)
+				{
+					m.convertTo(data_y, CV_64F);	// initialize data_y
+					
+					// DC removal and windowing
+					for (int p = 0; p<(data_y.rows); p++)
+					{
+						Scalar meanval = mean(data_y.row(p));
+						data_y.row(p) = data_y.row(p) - meanval(0);		// Only the first value of the scalar is useful for us
+						multiply(data_y.row(p), barthannwin, data_y.row(p));
+					}
+					
+					// interpolate to linear k space
+					for (int p = 0; p<(data_y.rows); p++)
+					{
+						for (int q = 1; q<(data_y.cols); q++)
+						{
+							//find the slope of the data_y at each of the non-linear ks
+							slopes.at<double>(p, q) = data_y.at<double>(p, q) - data_y.at<double>(p, q - 1);
+							// in the .at notation, it is <double>(y,x)
+						}
+						// initialize the first slope separately
+						slopes.at<double>(p, 0) = slopes.at<double>(p, 1);
+
+						for (int q = 1; q<(data_ylin.cols - 1); q++)
+						{
+							//find the value of the data_ylin at each of the klinear points
+							// data_ylin = data_y(nearestkindex) + fractionalk(nearestkindex)*slopes(nearestkindex)
+							data_ylin.at<double>(p, q) = data_y.at<double>(p, nearestkindex.at<int>(0, q))
+								+ fractionalk.at<double>(nearestkindex.at<int>(0, q))
+								* slopes.at<double>(p, nearestkindex.at<int>(0, q));
+						}
+					}
+					
+					// InvFFT - compute the bscan
+					Mat planes[] = { Mat_<float>(data_ylin), Mat::zeros(data_ylin.size(), CV_32F) };
+					Mat complexI;
+					merge(planes, 2, complexI);       // Add to the expanded another plane with zeros
+					dft(complexI, complexI, DFT_ROWS | DFT_INVERSE);
+					split(complexI, planes);          // planes[0] = Re(DFT(I)), planes[1] = Im(DFT(I))
+					magnitude(planes[0], planes[1], magI);
+					bscantemp = magI.colRange(0, numdisplaypoints);
+					bscantemp.convertTo(bscantemp, CV_64F);
+
+					// accumulate the J0Null background bscans to J
+					accumulate(bscantemp, J);
+					indextempJ++;
+					// cout << "indextempJ = " << indextempJ << endl;
+
+				} // end of if ret == 1 block
+		
+			} // end of while(indextempJ < averagescount)
+			
+			gettimeofday(&tv,NULL);	
+			time_end = 1000000 * tv.tv_sec + tv.tv_usec;	
+			
+			res = 0;
+			STOP = FALSE;
+			tcflush(fd, TCIFLUSH);
+
+			// write K to Arduino
+			write(fd, "K", sizeof("K"));
+			// cout << "\n Sent character \'K\' to the port ..." << endl;
+
+			// poll to read a character back from Arduino 
+			while (STOP==FALSE) 
+			{
+			  /* loop for input */
+			  res = read(fd,buf,255);   /* returns after 1 char has been input */
+			  buf[res]=0;               /* so we can printf... */
+			  // cout << endl << "Received from Arduino: " << buf <<"  - " << res << "byte" << endl;
+			  if (res > 0) STOP=TRUE;
+			}
+
+			// cout << "Sent LOW to line0 of camera ...";
+			// now read a batch of signal images from the camera  
+			indextempS = 0;
+			while(indextempS < averagescount)
+			{
+				ret = 0;
+				// save one image to Mat m
+				while(ret == 0)
+				{
+					pResultImage = pCam->GetNextImage();
+					if (pResultImage->IsIncomplete())
+					{
+						ret = 0;
+					}
+					else
+					{
+						ret = 1;
+						convertedImage = pResultImage;
+						//Mono16 w x h
+						m = cv::Mat(h, w, CV_16UC1, convertedImage->GetData(), convertedImage->GetStride());
+						nframes++;
+					}
+				}
+
+				// pResultImage has to be released to avoid buffer filling up
+				pResultImage->Release();
+
+				// convert m to data_y and process
+				if(ret == 1)
+				{
+					m.convertTo(data_y, CV_64F);	// initialize data_y
+					
+					// DC removal and windowing
+					for (int p = 0; p<(data_y.rows); p++)
+					{
+						Scalar meanval = mean(data_y.row(p));
+						data_y.row(p) = data_y.row(p) - meanval(0);		// Only the first value of the scalar is useful for us
+						multiply(data_y.row(p), barthannwin, data_y.row(p));
+					}
+					
+					// interpolate to linear k space
+					for (int p = 0; p<(data_y.rows); p++)
+					{
+						for (int q = 1; q<(data_y.cols); q++)
+						{
+							//find the slope of the data_y at each of the non-linear ks
+							slopes.at<double>(p, q) = data_y.at<double>(p, q) - data_y.at<double>(p, q - 1);
+							// in the .at notation, it is <double>(y,x)
+						}
+						// initialize the first slope separately
+						slopes.at<double>(p, 0) = slopes.at<double>(p, 1);
+
+						for (int q = 1; q<(data_ylin.cols - 1); q++)
+						{
+							//find the value of the data_ylin at each of the klinear points
+							// data_ylin = data_y(nearestkindex) + fractionalk(nearestkindex)*slopes(nearestkindex)
+							data_ylin.at<double>(p, q) = data_y.at<double>(p, nearestkindex.at<int>(0, q))
+								+ fractionalk.at<double>(nearestkindex.at<int>(0, q))
+								* slopes.at<double>(p, nearestkindex.at<int>(0, q));
+						}
+					}
+					
+					// InvFFT - compute the bscan
+					Mat planes[] = { Mat_<float>(data_ylin), Mat::zeros(data_ylin.size(), CV_32F) };
+					Mat complexI;
+					merge(planes, 2, complexI);       // Add to the expanded another plane with zeros
+					dft(complexI, complexI, DFT_ROWS | DFT_INVERSE);
+					split(complexI, planes);          // planes[0] = Re(DFT(I)), planes[1] = Im(DFT(I))
+					magnitude(planes[0], planes[1], magI);
+					bscantemp = magI.colRange(0, numdisplaypoints);
+					bscantemp.convertTo(bscantemp, CV_64F);
+
+					// accumulate the Signal bscans to S
+					accumulate(bscantemp, S);
+					indextempS++;
+					// cout << "indextempS = " << indextempS << endl;
+
+				} // end of if ret == 1 block
+		
+			} // end of while(indextempS < averagescount)
+
+			tcflush(fd, TCIFLUSH);
+
+			indextempJ = 0;
+			indextempS = 0;
+
+			transpose(J, jscan);
+			jscan = jscan / averagescount;
+
+			transpose(S, bscan);
+			bscan = bscan / averagescount;
+
+			jdiff = bscan - jscan;	// these are in linear scale
+			jdiff.copyTo(positivediff);		// just to initialize the Mat
+			makeonlypositive(jdiff, positivediff);
+			positivediff += 0.0000000001;			// to avoid log(0)
+		
+			log(positivediff, bscanlog);				// switch to logarithmic scale
+			bscandb = 20.0 * bscanlog / 2.303;
+			bscandb.row(4).copyTo(bscandb.row(1));	// masking out the DC in the display
+			bscandb.row(4).copyTo(bscandb.row(0));
+			tempmat = bscandb.rowRange(0, numdisplaypoints);
+			tempmat.copyTo(bscandisp);
+			bscandisp = max(bscandisp, bscanthreshold);
+			normalize(bscandisp, bscandisp, 0, 1, NORM_MINMAX);	// normalize the log plot for display
+			bscandisp.convertTo(bscandisp, CV_8UC1, 255.0);
+			applyColorMap(bscandisp, cmagI, COLORMAP_JET);
+			
+			imshow("Bscan", cmagI);
+			
+			if (accummode == true || refreshkeypressed == false)
+			{
+				J = jscan;
+				S = bscan;
+			}
+			else
+			{
+				J = Mat::zeros(Size(numdisplaypoints, h), CV_64F);
+				S = Mat::zeros(Size(numdisplaypoints, h), CV_64F);
+			}
+			if (accummode == true && refreshkeypressed == true)
+			{
+				refreshkeypressed = false;
+			}
+
+
+			// update the image windows
+			dt = time_end - time_start;
+
+			m.copyTo(mvector);
+			mvector.reshape(0, 1);	//make it into a row array
+			minMaxLoc(mvector, &minVal, &maxVal);
+			sprintf(textbuffer, "dt = %d  Max Intensity = %d", dt, int(floor(maxVal)));
+			firstrowofstatusimg = Mat::zeros(cv::Size(600, 50), CV_64F);
+			putText(statusimg, textbuffer, Point(0, 30), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
+		
+			if (accummode == false)	
+				sprintf(textbuffer, " Live mode ");
+			else
+				sprintf(textbuffer, "Accum. mode ");
+
+			secrowofstatusimgRHS = Mat::zeros(cv::Size(300, 50), CV_64F);
+			putText(statusimg, textbuffer, Point(300, 80), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
+			resizeWindow("show", w, h);
+			imshow("show", m);
+			
+			resizeWindow("Status", 600, 300);
+			imshow("Status", statusimg);
+				
+
+			key = waitKey(1); // wait for keypress
+			switch (key)
+			{
+
+			case 27: //ESC key
+			case 'x':
+			case 'X':
+				doneflag = true;
+				break;
+			
+			case '+':
+			case '=':
+				camtime = camtime + 100;
+				expchanged = true;
+				break;
+
+			case '-':
+			case '_':
+				if (camtime < 8)	// spinnaker has a min of 8 microsec
+				{
+					camtime = 8;
+					break;
+				}
+				camtime = camtime - 100;
+				expchanged = true;
+				break;
+			
+			case 'u':
+				camtime = camtime + 1000;
+				expchanged = true;
+				break;
+
+			case 'd':
+				if (camtime < 8)	// spinnaker has a min of 8 microsec
+				{
+					camtime = 8;
+					break;
+				}
+				camtime = camtime - 1000;
+				expchanged = true;
+				break;
+
+			case 'U':
+				camtime = camtime + 10000;
+				expchanged = true;
+				break;
+
+			case 'D':
+				if (camtime < 8)	// spinnaker has a min of 8 microsec
+				{
+					camtime = 8;
+					break;
+				}
+				camtime = camtime - 10000;
+				expchanged = true;
+				break;
+
+			case ']':
+				bscanthreshold += 1.0;
+				sprintf(textbuffer, "bscanthreshold = %f", bscanthreshold);
+				secrowofstatusimg = Mat::zeros(cv::Size(600, 50), CV_64F);
+				putText(statusimg, textbuffer, Point(0, 80), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
+				imshow("Status", statusimg);
+				break;
+
+			case '[':
+				bscanthreshold -= 1.0;
+				sprintf(textbuffer, "bscanthreshold = %f", bscanthreshold);
+				secrowofstatusimg = Mat::zeros(cv::Size(600, 50), CV_64F);
+				putText(statusimg, textbuffer, Point(0, 80), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
+				imshow("Status", statusimg);
+				break;
+		
+			case 'a':
+			case 'A':
+				// accumulate mode
+				accummode = true;
+				break;
+
+			case 'l':
+			case 'L':
+				// live mode
+				accummode = false;
+				break;
+
+			case 'r':
+			case 'R':
+				// refresh key pressed
+				refreshkeypressed = true;
+				break;
+
+			default:
+				break;
+			}
+
+			if (doneflag == 1)
+			{
+				break;
+			}
+
+			if (expchanged == true)
+			{
+				//Set exp with QuickSpin
+				ret = 0;
+				if (IsReadable(pCam->ExposureTime) && IsWritable(pCam->ExposureTime))
+				{
+					pCam->ExposureTime.SetValue(camtime);
+					ret = 1;
+				}
+				if (ret == 1)
+				{
+					sprintf(textbuffer, "Exp time = %d ", camtime);
+					secrowofstatusimg = Mat::zeros(cv::Size(600, 50), CV_64F);
+					putText(statusimg, textbuffer, Point(0, 80), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
+					imshow("Status", statusimg);
+
 				}
 				else
 				{
-					ret = 1;
-					num ++;
-					convertedImage = pResultImage;
-					//Mono16 w x h
-					m = cv::Mat(h, w, CV_16UC1, convertedImage->GetData(), convertedImage->GetStride());
-				}
-			}
-	    	// pResultImage has to be released to avoid buffer filling up
-			pResultImage->Release();
-
-			if(ret == 1)
-			{
-				m.convertTo(data_y, CV_64F);	// initialize data_y
-				// DC removal and windowing
-				for (int p = 0; p<(data_y.rows); p++)
-				{
-					Scalar meanval = mean(data_y.row(p));
-					data_y.row(p) = data_y.row(p) - meanval(0);		// Only the first value of the scalar is useful for us
-					multiply(data_y.row(p), barthannwin, data_y.row(p));
-				}
-				// interpolate to linear k space
-				for (int p = 0; p<(data_y.rows); p++)
-				{
-					for (int q = 1; q<(data_y.cols); q++)
-					{
-						//find the slope of the data_y at each of the non-linear ks
-						slopes.at<double>(p, q) = data_y.at<double>(p, q) - data_y.at<double>(p, q - 1);
-						// in the .at notation, it is <double>(y,x)
-					}
-					// initialize the first slope separately
-					slopes.at<double>(p, 0) = slopes.at<double>(p, 1);
-
-					for (int q = 1; q<(data_ylin.cols - 1); q++)
-					{
-						//find the value of the data_ylin at each of the klinear points
-						// data_ylin = data_y(nearestkindex) + fractionalk(nearestkindex)*slopes(nearestkindex)
-						data_ylin.at<double>(p, q) = data_y.at<double>(p, nearestkindex.at<int>(0, q))
-							+ fractionalk.at<double>(nearestkindex.at<int>(0, q))
-							* slopes.at<double>(p, nearestkindex.at<int>(0, q));
-					}
-				}
-				// InvFFT
-				Mat planes[] = { Mat_<float>(data_ylin), Mat::zeros(data_ylin.size(), CV_32F) };
-				Mat complexI;
-				merge(planes, 2, complexI);       // Add to the expanded another plane with zeros
-				dft(complexI, complexI, DFT_ROWS | DFT_INVERSE);
-				split(complexI, planes);          // planes[0] = Re(DFT(I)), planes[1] = Im(DFT(I))
-				magnitude(planes[0], planes[1], magI);
-				bscantemp = magI.colRange(0, numdisplaypoints);
-				bscantemp.convertTo(bscantemp, CV_64F);
-
-				if (J0Null == true && indextempJ < averagescount)
-				{
-					// accumulate
-					accumulate(bscantemp, J);
-					indextempJ++;
-				}
-				if (indextempJ >= averagescount)
-				{
-					J0Null = false;	
-				}
-				if (J0Null == false && indextempS < averagescount)
-				{
-					// accumulate
-					accumulate(bscantemp, S);
-					indextempS++;
-				}
-				if (indextempS >= averagescount)
-				{
-					J0Null = true;
-				}
-				if (indextempJ >= averagescount && indextempS >= averagescount)
-				{
-					sprintf(textbuffer, "%03d images acq.", indextemp);
-					secrowofstatusimgRHS = Mat::zeros(cv::Size(300, 50), CV_64F);
-					putText(statusimg, textbuffer, Point(300, 80), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
-					indextempJ = 0;
-					indextempS = 0;
-
-					// compute Bscan
-
-					transpose(J, jscan);
-					jscan = jscan / averagescount;
-
-					transpose(S, bscan);
-					bscan = bscan / averagescount;
-
-					jdiff = bscan - jscan;	// these are in linear scale
-					jdiff.copyTo(positivediff);		// just to initialize the Mat
-					makeonlypositive(jdiff, positivediff);
-					positivediff += 0.0000000001;			// to avoid log(0)
-				
-					log(positivediff, bscanlog);				// switch to logarithmic scale
-					bscandb = 20.0 * bscanlog / 2.303;
-					bscandb.row(4).copyTo(bscandb.row(1));	// masking out the DC in the display
-					bscandb.row(4).copyTo(bscandb.row(0));
-					tempmat = bscandb.rowRange(0, numdisplaypoints);
-					tempmat.copyTo(bscandisp);
-					bscandisp = max(bscandisp, bscanthreshold);
-					normalize(bscandisp, bscandisp, 0, 1, NORM_MINMAX);	// normalize the log plot for display
-					bscandisp.convertTo(bscandisp, CV_8UC1, 255.0);
-					applyColorMap(bscandisp, cmagI, COLORMAP_JET);
-					
-					imshow("Bscan", cmagI);
-					
-					if (accummode == true || refreshkeypressed == false)
-					{
-						J = jscan;
-						S = bscan;
-					}
-					else
-					{
-						J = Mat::zeros(Size(numdisplaypoints, h), CV_64F);
-						S = Mat::zeros(Size(numdisplaypoints, h), CV_64F);
-					}
-					if (accummode == true && refreshkeypressed == true)
-					{
-						refreshkeypressed = false;
-					}
-
-				}
-				// update the image windows
-				t_end = time(NULL);
-				fps++;
-				if (t_end - t_start >= 1)  // update every second
-				{
-					m.copyTo(mvector);
-					mvector.reshape(0, 1);	//make it into a row array
-					minMaxLoc(mvector, &minVal, &maxVal);
-					sprintf(textbuffer, "fps = %d   Max Intensity = %d", fps, int(floor(maxVal)));
-					firstrowofstatusimg = Mat::zeros(cv::Size(600, 50), CV_64F);
-					putText(statusimg, textbuffer, Point(0, 30), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
-					fps = 0;
-					t_start = time(NULL);
-					
-					resizeWindow("show", w, h);
-					imshow("show", m);
-					
-					resizeWindow("Status", 600, 300);
-					imshow("Status", statusimg);
-					
-				}
-				// cout << "number of images acquired: " << num << endl;
-
-				key = waitKey(1); // wait for keypress
-				switch (key)
-				{
-
-				case 27: //ESC key
-				case 'x':
-				case 'X':
-					doneflag = true;
-					break;
-				
-				case '+':
-				case '=':
-					camtime = camtime + 100;
-					expchanged = true;
-					break;
-
-				case '-':
-				case '_':
-					if (camtime < 8)	// spinnaker has a min of 8 microsec
-					{
-						camtime = 8;
-						break;
-					}
-					camtime = camtime - 100;
-					expchanged = true;
-					break;
-				
-				case 'u':
-					camtime = camtime + 1000;
-					expchanged = true;
-					break;
-
-				case 'd':
-					if (camtime < 8)	// spinnaker has a min of 8 microsec
-					{
-						camtime = 8;
-						break;
-					}
-					camtime = camtime - 1000;
-					expchanged = true;
-					break;
-
-				case 'U':
-					camtime = camtime + 10000;
-					expchanged = true;
-					break;
-
-				case 'D':
-					if (camtime < 8)	// spinnaker has a min of 8 microsec
-					{
-						camtime = 8;
-						break;
-					}
-					camtime = camtime - 10000;
-					expchanged = true;
-					break;
-
-				case ']':
-					bscanthreshold += 1.0;
-					sprintf(textbuffer, "bscanthreshold = %f", bscanthreshold);
+					sprintf(textbuffer, "CONTROL_EXPOSURE failed");
 					secrowofstatusimg = Mat::zeros(cv::Size(600, 50), CV_64F);
 					putText(statusimg, textbuffer, Point(0, 80), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
 					imshow("Status", statusimg);
-					break;
-
-				case '[':
-					bscanthreshold -= 1.0;
-					sprintf(textbuffer, "bscanthreshold = %f", bscanthreshold);
-					secrowofstatusimg = Mat::zeros(cv::Size(600, 50), CV_64F);
-					putText(statusimg, textbuffer, Point(0, 80), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
-					imshow("Status", statusimg);
-					break;
-			
-				case 'a':
-				case 'A':
-					// accumulate mode
-					accummode = true;
-					break;
-
-				case 'l':
-				case 'L':
-					// live mode
-					accummode = false;
-					break;
-
-				case 'r':
-				case 'R':
-					// refresh key pressed
-					refreshkeypressed = true;
-					break;
-
-				default:
-					break;
-				}
-	
-				if (doneflag == 1)
-				{
-					break;
 				}
 
-				if (expchanged == true)
-				{
-					//Set exp with QuickSpin
-					ret = 0;
-					if (IsReadable(pCam->ExposureTime) && IsWritable(pCam->ExposureTime))
-					{
-						pCam->ExposureTime.SetValue(camtime);
-						ret = 1;
-					}
-					if (ret == 1)
-					{
-						sprintf(textbuffer, "Exp time = %d ", camtime);
-						secrowofstatusimg = Mat::zeros(cv::Size(600, 50), CV_64F);
-						putText(statusimg, textbuffer, Point(0, 80), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
-						imshow("Status", statusimg);
-
-					}
-					else
-					{
-						sprintf(textbuffer, "CONTROL_EXPOSURE failed");
-						secrowofstatusimg = Mat::zeros(cv::Size(600, 50), CV_64F);
-						putText(statusimg, textbuffer, Point(0, 80), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 255, 255), 3, 1);
-						imshow("Status", statusimg);
-					}
-
-				} // end of if expchanged
-
-			} // end of if ret == 1 block
+			} // end of if expchanged
 
 		} // end of camera frames acquisition loop
 		
@@ -700,6 +858,8 @@ int main()
 		cout << "Error: " << e.what() << endl;
 		result = -1;
 	}
+	
+	tcsetattr(fd,TCSANOW,&oldtio);
 
     return result;
 }
